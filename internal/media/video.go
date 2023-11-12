@@ -18,11 +18,17 @@
 package media
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"image"
 	"io"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
 
-	"github.com/abema/go-mp4"
-	"github.com/superseriousbusiness/gotosocial/internal/iotools"
 	"github.com/superseriousbusiness/gotosocial/internal/log"
 )
 
@@ -34,98 +40,139 @@ type gtsVideo struct {
 }
 
 // decodeVideoFrame decodes and returns an image from a single frame in the given video stream.
-// (note: currently this only returns a blank image resized to fit video dimensions).
 func decodeVideoFrame(r io.Reader) (*gtsVideo, error) {
-	// we need a readseeker to decode the video...
-	tfs, err := iotools.TempFileSeeker(r)
+	tf, err := os.CreateTemp(os.TempDir(), "gts-video")
 	if err != nil {
-		return nil, fmt.Errorf("error creating temp file seeker: %w", err)
+		return nil, fmt.Errorf("creating temporary file for video processing: %w", err)
 	}
-	defer func() {
-		if err := tfs.Close(); err != nil {
-			log.Errorf(nil, "error closing temp file seeker: %s", err)
+	// defer func() {
+	// 	os.Remove(tf.Name())
+	// }()
+
+	log.Infof(nil, "created temporary file for video processing: %s", tf.Name())
+
+	_, err = io.Copy(tf, r)
+
+	if err != nil {
+		return nil, fmt.Errorf("writing video for processing: %w", err)
+	}
+
+	prog := "ffprobe"
+	args := []string{
+		"-select_streams", "v",
+		"-show_entries", "stream=r_frame_rate,bit_rate,duration",
+		"-of", "json",
+		tf.Name(),
+	}
+	cmd := exec.Command(prog, args...)
+	cmd.Stdin = r
+	out := bytes.NewBuffer(make([]byte, 0, 2048))
+	cmd.Stdout = out
+	cmdErrc := make(chan error, 1)
+	cmdErrOut, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	defer cmd.Process.Kill()
+	go func() {
+		out, err := io.ReadAll(cmdErrOut)
+		if err != nil {
+			cmdErrc <- err
+			return
 		}
+		cmd.Wait()
+		if cmd.ProcessState.Success() {
+			cmdErrc <- nil
+			return
+		}
+		cmdErrc <- fmt.Errorf("metadata probe subprocess failed:\n%s", out)
 	}()
+	select {
+	case err := <-cmdErrc:
+		if err != nil {
+			return nil, err
+		}
+	case <-time.After(time.Second):
+		return nil, fmt.Errorf("timeout during metadata probe process")
+	}
+	streamInfo := &struct {
+		Streams []struct {
+			Duration  string `json:"duration"`
+			BitRate   string `json:"bit_rate"`
+			FrameRate string `json:"r_frame_rate"`
+		} `json:"streams"`
+	}{}
+	if err := json.Unmarshal(out.Bytes(), &streamInfo); err != nil {
+		return nil, fmt.Errorf("failed parsing metadata: %w", err)
+	}
+	if len(streamInfo.Streams) == 0 {
+		return nil, fmt.Errorf("media container did not contain any video streams")
+	}
 
-	// probe the video file to extract useful metadata from it; for methodology, see:
-	// https://github.com/abema/go-mp4/blob/7d8e5a7c5e644e0394261b0cf72fef79ce246d31/mp4tool/probe/probe.go#L85-L154
-	info, err := mp4.Probe(tfs)
+	s := streamInfo.Streams[0]
+	video := gtsVideo{}
+
+	// duration
+	dur, err := strconv.ParseFloat(s.Duration, 32)
 	if err != nil {
-		return nil, fmt.Errorf("error during mp4 probe: %w", err)
+		return nil, fmt.Errorf("unable to decode video duration with value %s", s.Duration)
 	}
+	video.duration = float32(dur)
 
-	var (
-		width        int
-		height       int
-		videoBitrate uint64
-		audioBitrate uint64
-		video        gtsVideo
-	)
-
-	for _, tr := range info.Tracks {
-		if tr.AVC == nil {
-			// audio track
-			if br := tr.Samples.GetBitrate(tr.Timescale); br > audioBitrate {
-				audioBitrate = br
-			} else if br := info.Segments.GetBitrate(tr.TrackID, tr.Timescale); br > audioBitrate {
-				audioBitrate = br
-			}
-
-			if d := float64(tr.Duration) / float64(tr.Timescale); d > float64(video.duration) {
-				video.duration = float32(d)
-			}
-			continue
-		}
-
-		// video track
-		if w := int(tr.AVC.Width); w > width {
-			width = w
-		}
-
-		if h := int(tr.AVC.Height); h > height {
-			height = h
-		}
-
-		if br := tr.Samples.GetBitrate(tr.Timescale); br > videoBitrate {
-			videoBitrate = br
-		} else if br := info.Segments.GetBitrate(tr.TrackID, tr.Timescale); br > videoBitrate {
-			videoBitrate = br
-		}
-
-		if d := float64(tr.Duration) / float64(tr.Timescale); d > float64(video.duration) {
-			video.framerate = float32(len(tr.Samples)) / float32(d)
-			video.duration = float32(d)
-		}
+	// bitrate
+	br, err := strconv.ParseUint(s.BitRate, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode video bitrate with value %s", s.BitRate)
 	}
+	video.bitrate = br
 
-	// overall bitrate should be audio + video combined
-	// (since they're both playing at the same time)
-	video.bitrate = audioBitrate + videoBitrate
+	// framerate
+	frParts := strings.Split(s.FrameRate, "/")
+	if len(frParts) != 2 {
+		return nil, fmt.Errorf("unable to decode video framerate with value %s", s.FrameRate)
+	}
+	frCount, err := strconv.Atoi(frParts[0])
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode video framerate count with value %s", frParts[0])
+	}
+	frTime, err := strconv.Atoi(frParts[1])
+	if err != nil {
+		return nil, fmt.Errorf("unable to decode video framerate base with value %s", frParts[0])
+	}
+	video.framerate = float32(frCount) / float32(frTime)
 
-	// Check for empty video metadata.
-	var empty []string
-	if width == 0 {
-		empty = append(empty, "width")
+	frame, err := extractThumbnail(tf.Name())
+	if err != nil {
+		return nil, fmt.Errorf("extracting thumbnail: %w", err)
 	}
-	if height == 0 {
-		empty = append(empty, "height")
-	}
-	if video.duration == 0 {
-		empty = append(empty, "duration")
-	}
-	if video.framerate == 0 {
-		empty = append(empty, "framerate")
-	}
-	if video.bitrate == 0 {
-		empty = append(empty, "bitrate")
-	}
-	if len(empty) > 0 {
-		return nil, fmt.Errorf("error determining video metadata: %v", empty)
-	}
-
-	// Create new empty "frame" image.
-	// TODO: decode frame from video file.
-	video.frame = blankImage(width, height)
+	video.frame = frame
 
 	return &video, nil
+}
+
+func extractThumbnail(filepath string) (*gtsImage, error) {
+	args := []string{
+		"-i", filepath,
+		"-vf", "thumbnail=n=10",
+		"-frames:v", "1",
+		"-f", "image2pipe",
+		"-c:v", "mjpeg",
+		"pipe:1",
+	}
+
+	cmd := exec.Command("ffmpeg", args...)
+	b := bytes.NewBuffer([]byte{})
+	cmd.Stdout = b
+	err := cmd.Run()
+	if err != nil {
+		return nil, fmt.Errorf("extracting thumbnail using ffmpeg: %w", err)
+	}
+	img, _, err := image.Decode(b)
+	if err != nil {
+		return nil, fmt.Errorf("decoding generated thumbnail: %w", err)
+	}
+	return &gtsImage{img}, nil
 }
