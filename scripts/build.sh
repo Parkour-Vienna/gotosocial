@@ -7,7 +7,7 @@ log_exec() { echo "$ ${*}"; "$@"; }
 
 # Grab environment variables and set defaults + requirements.
 GO_BUILDTAGS="${GO_BUILDTAGS-} netgo osusergo static_build kvformat timetzdata"
-GO_LDFLAGS="${GO_LDFLAGS-} -s -w -extldflags '-static' -X 'main.Version=${VERSION:-$(git describe --tags --abbrev=0)}'"
+GO_LDFLAGS="${GO_LDFLAGS-} -s -w -extldflags '-static' -X 'main.Version=${VERSION:-$(git describe --tags --abbrev=0)}-pkv'"
 GO_GCFLAGS=${GO_GCFLAGS-}
 
 # Maintain old $DEBUG compat.

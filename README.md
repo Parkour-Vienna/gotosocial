@@ -1,4 +1,6 @@
-# GoToSocial <!-- omit in toc -->
+# GoToSocial PKV-Fork <!-- omit in toc -->
+
+This is a fork of GoToSocial extending video support using ffmpeg. This is done on a best effort basis and not continously updated.
 
 GoToSocial is an [ActivityPub](https://activitypub.rocks/) social network server, written in Golang.
 
