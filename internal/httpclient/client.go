@@ -133,8 +133,8 @@ func New(cfg Config) *Client {
 	}
 
 	if cfg.MaxBodySize <= 0 {
-		// By default set this to a reasonable 40MB.
-		cfg.MaxBodySize = int64(40 * bytesize.MiB)
+		// By default set this to a reasonable 512MB.
+		cfg.MaxBodySize = int64(512 * bytesize.MiB)
 	}
 
 	// Protect dialer with IP range sanitizer.
